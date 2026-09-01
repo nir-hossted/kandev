@@ -103,6 +103,7 @@ type RepositorySetDTO struct {
 type RepositorySetItemDTO struct {
 	RepositoryID string `json:"repository_id"`
 	Position     int    `json:"position"`
+	BaseBranch   string `json:"base_branch"`
 }
 
 type RepositoryBranchPolicyDTO struct {
@@ -772,6 +773,7 @@ func FromRepositorySet(set *models.RepositorySet) RepositorySetDTO {
 		items = append(items, RepositorySetItemDTO{
 			RepositoryID: item.RepositoryID,
 			Position:     item.Position,
+			BaseBranch:   item.BaseBranch,
 		})
 	}
 	return RepositorySetDTO{
