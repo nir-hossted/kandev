@@ -66,6 +66,15 @@ type recordedMessageSteerer interface {
 	SteerRecordedMessage(ctx context.Context, taskID, sessionID, prompt, model string, planMode bool, attachments []v1.MessageAttachment) (*orchestrator.PromptResult, error)
 }
 
+type taskCanvasGuidanceResolver interface {
+	TaskSessionCanvasGuidanceEnabled(ctx context.Context, taskID, sessionID string) (bool, error)
+}
+
+type canvasGuidanceProjection struct {
+	resolved bool
+	include  bool
+}
+
 // MessageHandlers handles WebSocket requests for messages
 type MessageHandlers struct {
 	service             *service.Service
@@ -166,6 +175,7 @@ func (h *MessageHandlers) injectMessageContext(
 	configMode bool,
 	startCreatedSession bool,
 	titleOwner bool,
+	includeCanvasGuidance bool,
 	content string,
 	trustedPromptContext string,
 ) string {
@@ -191,10 +201,22 @@ func (h *MessageHandlers) injectMessageContext(
 		RequiresCompletionSignal:       requiresSignal,
 		IncludeCoordinatorTaskControls: !configMode,
 		IncludeTaskTitleTool:           !configMode && titleOwner,
+		IncludeCanvasGuidance:          includeCanvasGuidance,
 		Autopilot:                      task.Autopilot,
 		IncludeUserQuestionTool:        !task.Autopilot && !sessionResp.Session.IsPassthrough,
 		IncludeParentQuestionTool:      task.Autopilot && task.ParentID != "",
 	}, referenceContext, trustedPromptContext, pullRequestTargetContext)
+}
+
+func (h *MessageHandlers) resolveCanvasGuidance(
+	ctx context.Context,
+	taskID, sessionID string,
+) (bool, error) {
+	resolver, ok := h.orchestrator.(taskCanvasGuidanceResolver)
+	if !ok {
+		return false, nil
+	}
+	return resolver.TaskSessionCanvasGuidanceEnabled(ctx, taskID, sessionID)
 }
 
 func (h *MessageHandlers) prepareDirectPrompt(
@@ -444,6 +466,10 @@ type wsAddMessageRequest struct {
 	EntityReferences      []v1.EntityReference        `json:"entity_references,omitempty"`
 	PlanCommentRefs       []models.TaskPlanCommentRef `json:"plan_comment_refs,omitempty"`
 	RequirePrimarySession bool                        `json:"require_primary_session,omitempty"`
+	// These fields are server-owned and are carried only from message admission
+	// to the created-session dispatch. They are intentionally not JSON fields.
+	canvasGuidanceResolved bool
+	includeCanvasGuidance  bool
 }
 
 type addMessageReplayIdentity struct {
@@ -664,10 +690,29 @@ func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*w
 		// "type in chat to start the agent" path. Wrap with the Kandev MCP
 		// system block before persisting so the DB row matches what the agent
 		// receives (and "Show formatted" reveals it).
+		includeCanvasGuidance := false
+		canvasGuidanceResolved := false
+		if task != nil && !task.IsFromOffice && !sessionResp.Session.IsPassthrough && !configMode {
+			canvasGuidanceResolved = true
+			var resolveErr error
+			includeCanvasGuidance, resolveErr = h.resolveCanvasGuidance(ctx, req.TaskID, req.TaskSessionID)
+			if resolveErr != nil {
+				if errors.Is(resolveErr, orchestrator.ErrTaskSessionPairMismatch) {
+					return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Task and session do not match", nil)
+				}
+				h.logger.Warn("failed to resolve canvas prompt capability; omitting optional guidance",
+					zap.String("task_id", req.TaskID),
+					zap.String("session_id", req.TaskSessionID),
+					zap.Error(resolveErr))
+				includeCanvasGuidance = false
+			}
+		}
 		storedContent = h.injectMessageContext(
-			ctx, req, sessionResp, task, configMode, startCreatedSession, titleOwner, storedContent,
+			ctx, req, sessionResp, task, configMode, startCreatedSession, titleOwner, includeCanvasGuidance, storedContent,
 			trustedPromptContext,
 		)
+		req.canvasGuidanceResolved = canvasGuidanceResolved
+		req.includeCanvasGuidance = includeCanvasGuidance
 	}
 	req.Content = storedContent
 	planCommentAttachmentClaim := len(req.PlanCommentRefs) > 0 && len(req.Attachments) > 0
@@ -1056,7 +1101,10 @@ func (h *MessageHandlers) dispatchPromptAsync(
 		h.forwardMessageAsPrompt(
 			promptCtx, taskID, sessionID, agentProfileID,
 			content, model, planMode, attachments, req.EntityReferences, isCreatedSession,
-			trustedPromptContext,
+			trustedPromptContext, canvasGuidanceProjection{
+				resolved: req.canvasGuidanceResolved,
+				include:  req.includeCanvasGuidance,
+			},
 		)
 	}()
 }
@@ -1119,11 +1167,22 @@ func (h *MessageHandlers) forwardMessageAsPrompt(
 	references []v1.EntityReference,
 	startCreated bool,
 	trustedPromptContext string,
+	canvasGuidance ...canvasGuidanceProjection,
 ) {
 	// For CREATED sessions, start the agent with this message as the initial prompt
 	if startCreated {
 		var err error
-		if starter, ok := h.orchestrator.(orchestrator.DirectPromptStarter); ok {
+		projection := canvasGuidanceProjection{}
+		if len(canvasGuidance) > 0 {
+			projection = canvasGuidance[0]
+		}
+		if starter, ok := h.orchestrator.(orchestrator.DirectPromptStarterWithCanvasGuidance); ok && len(canvasGuidance) > 0 {
+			_, err = starter.StartCreatedSessionWithPromptContextAndCanvasGuidance(
+				ctx, taskID, sessionID, agentProfileID,
+				content, true, planMode, false, attachments, references, trustedPromptContext,
+				projection.resolved, projection.include,
+			)
+		} else if starter, ok := h.orchestrator.(orchestrator.DirectPromptStarter); ok {
 			_, err = starter.StartCreatedSessionWithPromptContext(
 				ctx, taskID, sessionID, agentProfileID,
 				content, true, planMode, false, attachments, references, trustedPromptContext,
