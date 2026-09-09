@@ -12,6 +12,7 @@ import (
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/plancomments"
 	"github.com/kandev/kandev/internal/task/repository/plancommenttx"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
 	ws "github.com/kandev/kandev/pkg/websocket"
 	"github.com/stretchr/testify/require"
 )
@@ -31,9 +32,53 @@ func (s *planCommentQueueServiceStub) QueueMessageWithPlanComments(
 	return s.result, s.err
 }
 
+func (s *planCommentQueueServiceStub) Snapshot(
+	_ context.Context,
+	identity messagequeue.QueueSessionIdentity,
+) (*messagequeue.QueueStatus, error) {
+	status := &messagequeue.QueueStatus{
+		TaskID:               identity.TaskID,
+		SessionID:            identity.SessionID,
+		SessionIncarnationID: identity.SessionIncarnationID,
+	}
+	if s.result != nil && s.result.Message != nil {
+		status.Entries = []messagequeue.QueuedMessage{*s.result.Message}
+		status.Count = 1
+	}
+	return status, nil
+}
+
 type recordingPlanCommentQueueBus struct {
 	subjects []string
 	events   []*bus.Event
+}
+
+type recordingPlanCommentAttachmentPreparer struct {
+	prepared []string
+	claim    messagequeue.QueueAttachmentClaim
+	err      error
+}
+
+func (*recordingPlanCommentAttachmentPreparer) ClaimMessageAttachments(
+	context.Context,
+	string,
+	string,
+	[]v1.MessageAttachment,
+) error {
+	return nil
+}
+
+func (p *recordingPlanCommentAttachmentPreparer) PrepareQueueAttachmentClaim(
+	_ context.Context,
+	_ string,
+	attachments []v1.MessageAttachment,
+) (messagequeue.QueueAttachmentClaim, error) {
+	for _, attachment := range attachments {
+		if attachment.AttachmentID != "" {
+			p.prepared = append(p.prepared, attachment.AttachmentID)
+		}
+	}
+	return p.claim, p.err
 }
 
 func (b *recordingPlanCommentQueueBus) Publish(_ context.Context, subject string, event *bus.Event) error {
@@ -72,6 +117,7 @@ func TestWsQueueMessageAdmitsPlanCommentsAndPublishesSnapshot(t *testing.T) {
 	response, err := handlers.wsQueueMessage(context.Background(), createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
 		"session_id":              "session",
 		"task_id":                 "task",
+		"session_incarnation_id":  "incarnation",
 		"client_queue_id":         "client-queue",
 		"plan_comment_refs":       refs,
 		"require_primary_session": true,
@@ -80,6 +126,7 @@ func TestWsQueueMessageAdmitsPlanCommentsAndPublishesSnapshot(t *testing.T) {
 	require.Equal(t, ws.MessageTypeResponse, response.Type)
 	require.NotNil(t, service.request)
 	require.Equal(t, "client-queue", service.request.ClientQueueID)
+	require.Equal(t, "incarnation", service.request.SessionIncarnationID)
 	require.Equal(t, refs, service.request.PlanCommentRefs)
 	require.True(t, service.request.RequirePrimarySession)
 	require.Equal(t, messagequeue.QueuedByUser, service.request.UserID)
@@ -169,10 +216,12 @@ func TestWsQueueMessageMapsPlanCommentConflicts(t *testing.T) {
 	}
 }
 
-func TestWsQueueMessageRestoresOwnedAttachmentClaimsWhenCommentAdmissionFails(t *testing.T) {
+func TestWsQueueMessagePassesPreparedAttachmentClaimToAtomicCommentAdmission(t *testing.T) {
 	handlers, service, eventBus := newPlanCommentQueueHandlers(t)
 	service.err = messagequeue.ErrQueueFull
-	attachments := &recordingQueueAttachmentClaimer{}
+	attachments := &recordingPlanCommentAttachmentPreparer{claim: messagequeue.QueueAttachmentClaim{
+		OwnerID: "owner", WorkspaceID: "workspace", IDs: []string{"attachment"},
+	}}
 	handlers.SetAttachmentClaimer(attachments)
 
 	response, err := handlers.wsQueueMessage(context.Background(), createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
@@ -184,10 +233,8 @@ func TestWsQueueMessageRestoresOwnedAttachmentClaimsWhenCommentAdmissionFails(t 
 	}))
 	require.NoError(t, err)
 	require.Equal(t, ws.MessageTypeError, response.Type)
-	require.Equal(t, []string{"attachment"}, attachments.claims)
-	require.Equal(t, "queue", attachments.claimQueueID)
-	require.Equal(t, []string{"attachment"}, attachments.restores)
-	require.Empty(t, attachments.releases)
+	require.Equal(t, []string{"attachment"}, attachments.prepared)
+	require.Equal(t, &attachments.claim, service.request.AttachmentClaim)
 	require.Empty(t, eventBus.subjects)
 }
 
@@ -212,5 +259,5 @@ func newPlanCommentQueueHandlers(
 
 var _ QueueService = (*planCommentQueueServiceStub)(nil)
 var _ bus.EventBus = (*recordingPlanCommentQueueBus)(nil)
-var _ QueueAttachmentReleaser = (*recordingQueueAttachmentClaimer)(nil)
-var _ QueueAttachmentAdmissionClaimer = (*recordingQueueAttachmentClaimer)(nil)
+var _ QueueAttachmentClaimer = (*recordingPlanCommentAttachmentPreparer)(nil)
+var _ QueueAttachmentClaimPreparer = (*recordingPlanCommentAttachmentPreparer)(nil)

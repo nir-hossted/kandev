@@ -84,6 +84,7 @@ type MockSession = {
   state: string;
   foreground_activity?: string;
   is_primary?: boolean;
+  queue_incarnation_id?: string;
 };
 
 function makeStoreState(sessionState: string, planMode = false, foregroundActivity?: string) {
@@ -93,12 +94,14 @@ function makeStoreState(sessionState: string, planMode = false, foregroundActivi
     state: sessionState,
     foreground_activity: foregroundActivity,
     is_primary: false,
+    queue_incarnation_id: "inc-1",
   };
   const primary = {
     id: "primary-session",
     task_id: "task-1",
     state: "WAITING_FOR_INPUT",
     is_primary: true,
+    queue_incarnation_id: "inc-primary",
   };
   const items: Record<string, MockSession> = {
     "sess-1": selected,
@@ -484,6 +487,7 @@ describe("useRunComment — plan routing", () => {
 
     expect(mockQueueMessage).toHaveBeenCalledWith({
       session_id: "primary-session",
+      session_incarnation_id: "inc-primary",
       task_id: "task-1",
       client_queue_id: expect.any(String),
       content: "",

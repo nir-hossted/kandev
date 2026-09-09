@@ -50,6 +50,20 @@ var (
 	commentVersionNeeded = mapping{service.ErrPlanCommentVersionNeeded, ws.ErrorCodeValidation, "expected_version must be positive"}
 	commentAnchorInvalid = mapping{service.ErrPlanCommentAnchorInvalid, ws.ErrorCodeValidation, "plan comment anchor is invalid"}
 	planCommentsChanged  = mapping{service.ErrTaskPlanCommentsChanged, ws.ErrorCodePlanCommentsChanged, "Task plan comments changed"}
+	contentRequired      = mapping{service.ErrContentRequired, ws.ErrorCodeValidation, "content is required"}
+	// appendFragmentWhitespaceOnly maps the whitespace-only fragment error.
+	appendFragmentWhitespaceOnly = mapping{
+		service.ErrPlanAppendFragmentWhitespaceOnly, ws.ErrorCodeValidation,
+		"append fragment must contain a non-whitespace character",
+	}
+	// planContentUnreadable reports a stored-plan read failure as a distinct
+	// code from planNotFound so the caller cannot mistake one for the other.
+	// The message is fixed rather than derived from err.Error(), so it never
+	// leaks the underlying storage failure.
+	planContentUnreadable = mapping{
+		service.ErrPlanContentReadFailed, ws.ErrorCodeInternalError,
+		"Could not read the current plan content; the append was not applied",
+	}
 
 	// allMappings is the vocabulary reachable by an action that can surface any
 	// plan or revision failure.
@@ -62,6 +76,9 @@ var (
 		revisionIDRequired,
 		revisionNotFound,
 		revisionTaskMismatch,
+		contentRequired,
+		appendFragmentWhitespaceOnly,
+		planContentUnreadable,
 	}
 )
 
@@ -149,7 +166,10 @@ func UpdateError(msg *ws.Message, err error) (*ws.Message, error) {
 	if out, matched, mapErr := contentTooLargeResponse(msg, err); matched {
 		return out, mapErr
 	}
-	return errorResponse(msg, err, "Failed to update task plan: "+err.Error(), []mapping{taskIDRequired, taskNotFound, planNotFound})
+	return errorResponse(msg, err, "Failed to update task plan: "+err.Error(), []mapping{
+		taskIDRequired, taskNotFound, planNotFound,
+		contentRequired, appendFragmentWhitespaceOnly, planContentUnreadable,
+	})
 }
 
 // DeleteError maps a PlanService.DeletePlan failure.

@@ -20,6 +20,7 @@ import { planCommentAdmissionConflict, toTaskPlanCommentRefs } from "@/lib/plan-
 import {
   collectPromptReferenceExpansions,
   formatPromptReferenceExpansions,
+  sanitizePromptReferenceSystemText,
 } from "@/lib/prompts/expand-prompt-references";
 import {
   deriveSessionInputMode,
@@ -120,7 +121,7 @@ export function buildContextFilesContext(
             promptExpansions.set(expansion.name, expansion.content);
           }
         }
-        return `### ${prompt.name}\n${prompt.content}`;
+        return `### ${sanitizePromptReferenceSystemText(prompt.name)}\n${sanitizePromptReferenceSystemText(prompt.content)}`;
       })
       .filter(Boolean);
 

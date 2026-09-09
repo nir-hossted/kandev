@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/authz"
 	"github.com/kandev/kandev/internal/events"
 	"github.com/kandev/kandev/internal/events/bus"
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
@@ -50,6 +51,11 @@ type queuedPlanCommentMessageWriter interface {
 func (s *Service) CreateMessage(ctx context.Context, req *CreateMessageRequest) (*models.Message, error) {
 	if err := preparePlanCommentMessageRequest(req); err != nil {
 		return nil, err
+	}
+	if req.AuthorType != createdByAgent {
+		if err := s.AuthorizeSessionScope(ctx, req.TaskSessionID, authz.ScopeSessionPrompt); err != nil {
+			return nil, err
+		}
 	}
 	messageID := uuid.New().String()
 	session, err := s.getSessionWithRetry(
@@ -109,7 +115,7 @@ func (s *Service) CreateMessage(ctx context.Context, req *CreateMessageRequest) 
 		TaskID:        taskID,
 		TurnID:        turnID,
 		AuthorType:    authorType,
-		AuthorID:      req.AuthorID,
+		AuthorID:      s.resolveAuthorID(ctx, authorType, req.AuthorID),
 		Content:       req.Content,
 		Type:          messageType,
 		Metadata:      req.Metadata,
@@ -1208,4 +1214,22 @@ func firstRestoredClarification(messages []*models.Message) *models.Message {
 		}
 	}
 	return nil
+}
+
+// resolveAuthorID stamps a human message with the *authenticated* caller
+// rather than whatever author_id the browser sent.
+//
+// Attribution is the whole reason a team uses accounts instead of a shared
+// login, so it cannot be client-supplied: any user could otherwise post as a
+// colleague. Agent messages keep the caller-supplied ID, which names an agent
+// execution rather than a person, and an unauthenticated (internal or
+// auth-disabled) caller keeps today's behavior.
+func (s *Service) resolveAuthorID(ctx context.Context, authorType models.MessageAuthorType, requested string) string {
+	if authorType != models.MessageAuthorUser {
+		return requested
+	}
+	if userID, scoped := callerScope(ctx); scoped {
+		return userID
+	}
+	return requested
 }

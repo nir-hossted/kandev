@@ -20,9 +20,11 @@ import (
 type planCommentQueueWriter interface {
 	InsertWithPlanComments(
 		context.Context,
+		messagequeue.QueueSessionIdentity,
 		*messagequeue.QueuedMessage,
 		[]models.TaskPlanCommentRef,
 		bool,
+		*messagequeue.QueueAttachmentClaim,
 		int,
 	) (*models.TaskPlanCommentSnapshot, bool, error)
 }
@@ -34,8 +36,9 @@ func TestSQLiteRepositoryInsertWithPlanCommentsConsumesAtomically(t *testing.T) 
 	writer := requirePlanCommentQueueWriter(t, queueRepo)
 	refs := []models.TaskPlanCommentRef{{ID: "comment-atomic", Version: 1}}
 	queued := planCommentQueuedMessage("atomic", "queue-comment-atomic", "fingerprint-atomic", refs)
+	identity := resolvePlanCommentQueueIdentity(t, ctx, queueRepo, queued)
 
-	snapshot, replay, err := writer.InsertWithPlanComments(ctx, queued, refs, true, 10)
+	snapshot, replay, err := writer.InsertWithPlanComments(ctx, identity, queued, refs, true, nil, 10)
 	if err != nil {
 		t.Fatalf("InsertWithPlanComments: %v", err)
 	}
@@ -62,12 +65,13 @@ func TestSQLiteRepositoryInsertWithPlanCommentsReplayIsIdempotent(t *testing.T) 
 	writer := requirePlanCommentQueueWriter(t, queueRepo)
 	refs := []models.TaskPlanCommentRef{{ID: "comment-replay", Version: 1}}
 	first := planCommentQueuedMessage("replay", "queue-comment-replay", "fingerprint-replay", refs)
-	if _, replay, err := writer.InsertWithPlanComments(ctx, first, refs, true, 10); err != nil || replay {
+	identity := resolvePlanCommentQueueIdentity(t, ctx, queueRepo, first)
+	if _, replay, err := writer.InsertWithPlanComments(ctx, identity, first, refs, true, nil, 10); err != nil || replay {
 		t.Fatalf("first insert replay=%v err=%v", replay, err)
 	}
 
 	retry := planCommentQueuedMessage("replay", first.ID, "fingerprint-replay", refs)
-	snapshot, replay, err := writer.InsertWithPlanComments(ctx, retry, refs, true, 10)
+	snapshot, replay, err := writer.InsertWithPlanComments(ctx, identity, retry, refs, true, nil, 10)
 	if err != nil || !replay || snapshot != nil {
 		t.Fatalf("retry snapshot=%#v replay=%v err=%v", snapshot, replay, err)
 	}
@@ -80,12 +84,39 @@ func TestSQLiteRepositoryInsertWithPlanCommentsReplayIsIdempotent(t *testing.T) 
 	}
 
 	conflict := planCommentQueuedMessage("replay", first.ID, "different-fingerprint", refs)
-	if _, _, err := writer.InsertWithPlanComments(ctx, conflict, refs, true, 10); !errors.Is(err, messagequeue.ErrQueueIDConflict) {
+	if _, _, err := writer.InsertWithPlanComments(ctx, identity, conflict, refs, true, nil, 10); !errors.Is(err, messagequeue.ErrQueueIDConflict) {
 		t.Fatalf("conflicting replay error = %v, want ErrQueueIDConflict", err)
 	}
 	pending, err := taskRepo.ListTaskPlanComments(ctx, first.TaskID)
 	if err != nil || pending.Revision != 2 || len(pending.Comments) != 0 {
 		t.Fatalf("pending snapshot = %#v, err=%v", pending, err)
+	}
+}
+
+func TestSQLiteRepositoryInsertWithPlanCommentsRejectsStaleSessionIncarnation(t *testing.T) {
+	taskRepo, queueRepo := newPlanCommentQueueRepos(t)
+	ctx := context.Background()
+	seedQueuePlanComment(t, ctx, taskRepo, "stale-incarnation")
+	refs := []models.TaskPlanCommentRef{{ID: "comment-stale-incarnation", Version: 1}}
+	queued := planCommentQueuedMessage(
+		"stale-incarnation", "queue-comment-stale-incarnation", "fingerprint-stale-incarnation", refs,
+	)
+	identity := resolvePlanCommentQueueIdentity(t, ctx, queueRepo, queued)
+	identity.SessionIncarnationID = "stale-incarnation"
+
+	snapshot, replay, err := requirePlanCommentQueueWriter(t, queueRepo).InsertWithPlanComments(
+		ctx, identity, queued, refs, true, nil, 10,
+	)
+	if !errors.Is(err, messagequeue.ErrSessionIdentityMismatch) || snapshot != nil || replay {
+		t.Fatalf("stale identity admission snapshot=%#v replay=%v err=%v", snapshot, replay, err)
+	}
+	entries, listErr := queueRepo.ListBySession(ctx, queued.SessionID)
+	if listErr != nil || len(entries) != 0 {
+		t.Fatalf("queue after stale identity = %#v, err=%v", entries, listErr)
+	}
+	pending, listErr := taskRepo.ListTaskPlanComments(ctx, queued.TaskID)
+	if listErr != nil || pending.Revision != 1 || len(pending.Comments) != 1 {
+		t.Fatalf("comments after stale identity = %#v, err=%v", pending, listErr)
 	}
 }
 
@@ -152,9 +183,10 @@ func TestSQLiteRepositoryInsertWithPlanCommentsFailuresPreserveComments(t *testi
 			if test.prepare != nil {
 				test.prepare(t, ctx, taskRepo, queueRepo, queued)
 			}
+			identity := resolvePlanCommentQueueIdentity(t, ctx, queueRepo, queued)
 
 			snapshot, replay, err := requirePlanCommentQueueWriter(t, queueRepo).
-				InsertWithPlanComments(ctx, queued, test.refs, test.requirePri, test.max)
+				InsertWithPlanComments(ctx, identity, queued, test.refs, test.requirePri, nil, test.max)
 			if !test.assertErr(err) || snapshot != nil || replay {
 				t.Fatalf("result snapshot=%#v replay=%v err=%#v", snapshot, replay, err)
 			}
@@ -197,6 +229,10 @@ func TestPostgresInsertWithPlanCommentsConcurrentQueueIDConflictIsTyped(t *testi
 	writers := []planCommentQueueWriter{
 		requirePlanCommentQueueWriter(t, queueRepoA), requirePlanCommentQueueWriter(t, queueRepoB),
 	}
+	identities := []messagequeue.QueueSessionIdentity{
+		resolvePlanCommentQueueIdentity(t, ctx, queueRepoA, messages[0]),
+		resolvePlanCommentQueueIdentity(t, ctx, queueRepoB, messages[1]),
+	}
 	refs := [][]models.TaskPlanCommentRef{refsA, refsB}
 	start := make(chan struct{})
 	errs := make([]error, 2)
@@ -206,7 +242,9 @@ func TestPostgresInsertWithPlanCommentsConcurrentQueueIDConflictIsTyped(t *testi
 		go func(index int) {
 			defer wg.Done()
 			<-start
-			_, _, errs[index] = writers[index].InsertWithPlanComments(ctx, messages[index], refs[index], true, 10)
+			_, _, errs[index] = writers[index].InsertWithPlanComments(
+				ctx, identities[index], messages[index], refs[index], true, nil, 10,
+			)
 		}(i)
 	}
 	close(start)
@@ -265,6 +303,20 @@ func requirePlanCommentQueueWriter(t *testing.T, repo messagequeue.Repository) p
 		t.Fatal("queue repository does not implement atomic plan-comment admission")
 	}
 	return writer
+}
+
+func resolvePlanCommentQueueIdentity(
+	t *testing.T,
+	ctx context.Context,
+	repo messagequeue.Repository,
+	queued *messagequeue.QueuedMessage,
+) messagequeue.QueueSessionIdentity {
+	t.Helper()
+	identity, err := repo.ResolveSessionIdentity(ctx, queued.TaskID, queued.SessionID)
+	if err != nil {
+		t.Fatalf("resolve queue session identity: %v", err)
+	}
+	return identity
 }
 
 func seedQueuePlanComment(t *testing.T, ctx context.Context, repo *tasksqlite.Repository, suffix string) {

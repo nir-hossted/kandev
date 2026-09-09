@@ -176,12 +176,13 @@ func TestPlanCommentsUseStableOrderAndPlanLifecycle(t *testing.T) {
 		t.Fatalf("stable order = %v", got)
 	}
 
-	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+	session := &models.TaskSession{
 		ID: "session-comments-life", TaskID: "task-plan-comments-life",
-	}); err != nil {
+	}
+	if err := repo.CreateTaskSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.DeleteTaskSession(ctx, "session-comments-life"); err != nil {
+	if err := repo.DeleteTaskSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
 	if snapshot, err = repo.ListTaskPlanComments(ctx, "task-plan-comments-life"); err != nil || len(snapshot.Comments) != 2 {

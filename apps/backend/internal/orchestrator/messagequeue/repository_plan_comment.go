@@ -18,41 +18,39 @@ import (
 // never discarded.
 func (r *sqliteRepository) InsertWithPlanComments(
 	ctx context.Context,
+	identity QueueSessionIdentity,
 	msg *QueuedMessage,
 	refs []models.TaskPlanCommentRef,
 	requirePrimary bool,
+	claim *QueueAttachmentClaim,
 	maxPerSession int,
 ) (*models.TaskPlanCommentSnapshot, bool, error) {
 	if msg == nil || msg.ID == "" {
 		return nil, false, errors.New("client queue id is required")
 	}
+	if msg.TaskID != identity.TaskID || msg.SessionID != identity.SessionID {
+		return nil, false, ErrSessionIdentityMismatch
+	}
 	candidate := *msg
-	tx, err := r.db.BeginTxx(ctx, nil)
+	tx, err := r.beginPlanCommentQueueAdmission(ctx, identity, &candidate)
 	if err != nil {
-		return nil, false, fmt.Errorf("begin plan-comment queue admission: %w", err)
+		return nil, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := r.guardActiveTaskTx(ctx, tx, candidate.TaskID); err != nil {
-		return nil, false, err
-	}
-	if err := r.lockSessionTx(ctx, tx, candidate.SessionID); err != nil {
-		return nil, false, err
-	}
-	existing, err := r.findQueuedMessageByIDTx(ctx, tx, candidate.ID)
+	existing, replay, err := r.commitPlanCommentQueueReplay(ctx, tx, &candidate, refs)
 	if err != nil {
 		return nil, false, err
 	}
-	if existing != nil {
-		if !samePlanCommentQueueRequest(existing, &candidate, refs) {
-			return nil, false, ErrQueueIDConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, false, fmt.Errorf("commit plan-comment queue replay: %w", err)
-		}
+	if replay {
 		*msg = *existing
 		return nil, true, nil
 	}
 	if err := r.ensureQueueCapacity(ctx, tx, candidate.SessionID, maxPerSession); err != nil {
+		return nil, false, err
+	}
+	if err := claimOptionalMessageAttachmentsTx(
+		ctx, tx, &identity, claim, candidate.TaskID, candidate.SessionID,
+	); err != nil {
 		return nil, false, err
 	}
 	resolved, err := plancommenttx.Resolve(
@@ -74,6 +72,52 @@ func (r *sqliteRepository) InsertWithPlanComments(
 	}
 	*msg = candidate
 	return snapshot, false, nil
+}
+
+func (r *sqliteRepository) beginPlanCommentQueueAdmission(
+	ctx context.Context,
+	identity QueueSessionIdentity,
+	candidate *QueuedMessage,
+) (*sqlx.Tx, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin plan-comment queue admission: %w", err)
+	}
+	if err := r.guardActiveTaskTx(ctx, tx, candidate.TaskID); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := r.lockSessionTx(ctx, tx, candidate.SessionID); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := r.validateSessionIdentityTx(ctx, tx, identity); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
+func (r *sqliteRepository) commitPlanCommentQueueReplay(
+	ctx context.Context,
+	tx *sqlx.Tx,
+	candidate *QueuedMessage,
+	refs []models.TaskPlanCommentRef,
+) (*QueuedMessage, bool, error) {
+	existing, err := r.findQueuedMessageByIDTx(ctx, tx, candidate.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing == nil {
+		return nil, false, nil
+	}
+	if !samePlanCommentQueueRequest(existing, candidate, refs) {
+		return nil, false, ErrQueueIDConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit plan-comment queue replay: %w", err)
+	}
+	return existing, true, nil
 }
 
 func (r *sqliteRepository) findQueuedMessageByIDTx(
