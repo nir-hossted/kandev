@@ -162,7 +162,7 @@ test.describe("mobile: task-owned plan comments", () => {
     await testPage.getByTestId(`mobile-session-row-${secondary.id}`).tap();
 
     await session.togglePlanMode();
-    await testPage.getByRole("button", { name: "Plan", exact: true }).tap();
+    await testPage.getByRole("navigation").getByRole("button", { name: "Plan", exact: true }).tap();
     const editor = session.planPanel.locator(".ProseMirror:visible");
     await expect(editor).toBeVisible({ timeout: 10_000 });
     await editor.focus();
